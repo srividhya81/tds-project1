@@ -24,9 +24,12 @@
 # ]
 # ///   
 
+from asyncio import Task
 import csv
 import inspect
+from itertools import combinations
 from logging import config
+import logging
 import shutil
 import pytesseract
 from fastapi import FastAPI, HTTPException, Query
@@ -49,7 +52,7 @@ import duckdb
 import markdown
 import pandas as pd
 from dateutil import parser
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 from bs4 import BeautifulSoup
 
 load_dotenv()
@@ -142,47 +145,25 @@ def format_markdown():
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=500, detail=f"Error formatting Markdown: {str(e)}")            
 
-def sort_contacts(task):
-    # Default sorting order
-    sort_keys = [("last_name", "asc"), ("first_name", "asc")]
-
-    # Extract sorting criteria from the task description
-    task_lower = task.lower()
+def sort_contacts(task: str):
+    parts = task.lower().split(" ")
+    sort_by = "first_name" if "first" in parts else "last_name"
+    order = "desc" if "descending" in parts else "asc"
     
-    # Detect sorting order (ascending or descending)
-    if "descending" in task_lower or "desc" in task_lower:
-        order = "desc"
-    else:
-        order = "asc"  # Default
+    contacts_file = os.path.join(DATA_DIR, "contacts.json")
+    if not os.path.exists(contacts_file):
+        return "Contacts file not found."
 
-    # Detect which keys to sort by
-    if "first name then last name" in task_lower:
-        sort_keys = [("first_name", order), ("last_name", order)]
-    elif "last name then first name" in task_lower:
-        sort_keys = [("last_name", order), ("first_name", order)]
-    elif "first name" in task_lower:
-        sort_keys = [("first_name", order)]
-    elif "last name" in task_lower:
-        sort_keys = [("last_name", order)]
+    with open(contacts_file, "r") as f:
+        contacts = json.load(f)
 
-    try:
-        # Read the contacts file
-        with open(f"{DATA_DIR}/contacts.json", "r") as f:
-            contacts = json.load(f)
-
-        # Perform sorting based on extracted criteria
-        for key, direction in reversed(sort_keys):  # Sort in reverse order for stability
-            reverse = direction == "desc"
-            contacts.sort(key=lambda x: x.get(key, "").lower(), reverse=reverse)
-
-        # Write the sorted contacts to a new file
-        with open(f"{DATA_DIR}/contacts-sorted.json", "w") as f:
-            json.dump(contacts, f, indent=2)
-
-        return f"Contacts sorted by {', '.join([f'{k} ({d})' for k, d in sort_keys])} successfully."
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error sorting contacts: {str(e)}")
+    reverse_order = order == "desc"
+    contacts.sort(key=lambda x: x.get(sort_by, "").lower(), reverse=reverse_order)
+    
+    with open(contacts_file, "w") as f:
+        json.dump(contacts, f, indent=4)
+    
+    return f"Contacts sorted by {sort_by} in {order} order."
 def extract_logs(task):
     log_dir = f"{DATA_DIR}/logs"
     
@@ -196,7 +177,7 @@ def extract_logs(task):
 
     # Determine sorting order from task description
     task_lower = task.lower()
-    if "oldest" in task_lower:
+    if "oldest or old" in task_lower:
         log_files.sort(key=os.path.getmtime)  # Sort by oldest first
     else:
         log_files.sort(key=os.path.getmtime, reverse=True)  # Default: most recent first
@@ -239,147 +220,153 @@ def create_markdown_index():
         json.dump(index, f, indent=2)
 
     return f"Markdown index created at {index_path}"
+
+
+def clean_and_parse_json(response_text):
+    """Cleans and safely parses LLM JSON responses."""
+    try:
+        # Remove trailing commas before parsing
+        cleaned_text = re.sub(r",\s*([\]}])", r"\1", response_text.strip())
+        return json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        logging.error("Invalid JSON response from LLM. Extracting key-value pairs manually.")
+        return extract_key_value_pairs_manually(response_text)  # Fallback parsing method
+
+
 def extract_email_info(task):
-    email_file = f"{DATA_DIR}/email.txt"
-
-    if not os.path.exists(email_file):
-        raise HTTPException(status_code=404, detail="Email file not found.")
-
-    with open(email_file, "r", encoding="utf-8") as f:
+    with open(f"{DATA_DIR}/email.txt") as f:
         email_content = f.read()
-
-    # Define possible extraction requests
-    extraction_options = {
-        "sender's email": "Extract only the sender's email address.",
-        "sender's name": "Extract only the sender's name.",
-        "receiver's email": "Extract only the receiver's email address.",
-        "receiver's name": "Extract only the receiver's name.",
-        "cc emails": "Extract all CC email addresses.",
-        "email date": "Extract the date when the email was sent."
-    }
-
-    # Determine the specific information to extract
-    task_lower = task.lower()
-    extract_instruction = "Extract the sender's email address."  # Default task
-    for key, instruction in extraction_options.items():
-        if key in task_lower:
-            extract_instruction = instruction
-            break
-
-    # Call LLM to extract the requested detail
-    response = client.chat.ChatCompletion.create(
-        model="gpt-4",
+    
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": extract_instruction},
+            {"role": "system", "content": "Extract sender name, receiver email ID, receiver name, subject, date, and CC from the following email. Return the result strictly as a JSON object with keys: sender_name, receiver_email, receiver_name, subject, date, and cc."},
             {"role": "user", "content": email_content}
         ]
     )
 
-    extracted_info = response["choices"][0]["message"]["content"].strip()
+    response_content = response.choices[0].message.content.strip()
 
-    # Determine output file dynamically
-    file_map = {
-        "sender's email": "email-sender.txt",
-        "sender's name": "email-sender-name.txt",
-        "receiver's email": "email-receiver.txt",
-        "receiver's name": "email-receiver-name.txt",
-        "cc emails": "email-cc.txt",
-        "email date": "email-date.txt"
+    # Debugging: Print response content
+    logging.info(f"LLM Response: {response_content}")
+
+    # Remove triple backticks and JSON keyword if present
+    response_content = re.sub(r"```json\n(.*?)\n```", r"\1", response_content, flags=re.DOTALL)
+
+    try:
+        extracted_info = json.loads(response_content)
+    except json.JSONDecodeError:
+        logging.error("Invalid JSON response from LLM. Extracting key-value pairs manually.")
+        extracted_info = extract_key_value_pairs_manually(response_content)
+
+    # Determine which fields to include based on the query
+    requested_fields = []
+    field_map = {
+        "sender": "sender_name",
+        "receiver": "receiver_email",
+        "receiver name": "receiver_name",
+        "subject": "subject",
+        "date": "date",
+        "cc": "cc"
     }
 
-    output_filename = file_map.get(task_lower, "email-sender.txt")
-    output_path = os.path.join(DATA_DIR, output_filename)
+    for key in field_map:
+        if key in task.lower():
+            requested_fields.append(field_map[key])
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(extracted_info)
+    if not requested_fields:
+        requested_fields = field_map.values()  # Default to all fields if none are explicitly asked
 
-    return f"Extracted '{task_lower}' and saved to {output_path}"
+    # Save only the requested fields in a text file
+    with open(f"{DATA_DIR}/email-sender.txt", "w") as f:
+        for field in requested_fields:
+            if field in extracted_info:
+                f.write(f"{field.replace('_', ' ').title()}: {extracted_info[field]}\n")
 
-def extract_credit_card_info(task):
-    img_path = f"{DATA_DIR}/credit-card.png"
+    return {"message": "Email info extracted", "path": f"{DATA_DIR}/email-sender.txt"}
 
-    if not os.path.exists(img_path):
-        raise HTTPException(status_code=404, detail="Credit card image not found.")
+def extract_key_value_pairs_manually(text):
+    """Fallback method to extract key-value pairs manually if JSON parsing fails."""
+    extracted_data = {}
+    matches = re.findall(r'"([\w\s]+)"\s*:\s*"([^"]+)"', text)
+    for key, value in matches:
+        extracted_data[key] = value
+    return extracted_data
 
-    img = Image.open(img_path)
-    extracted_text = pytesseract.image_to_string(img)
 
-    # Clean extracted text
-    extracted_text = extracted_text.replace("\n", " ").strip()
+def parse_credit_card_info(text: str) -> Dict[str, Optional[str]]:
+    card_number_match = re.search(r"\b\d{4}[ -]?\d{4}[ -]?\d{4}[ -]?\d{1,4}\b", text)
+    valid_thru_match = re.search(r"\b(0[1-9]|1[0-2])/\d{2}\b", text)
+    cvv_match = re.findall(r"\b\d{3,4}\b", text)
 
-    # Patterns for extracting information
-    patterns = {
-        "card number": r"\b(\d{4}[-\s]?\d{4}[-\s]?\d{4})\b",  # 12-digit card number (4-4-4)
-        "cvv": r"\b(\d{3})\b",  # 3-digit CVV
-        "name": r"([A-Z ]+)\b(?!.*(valid|thru|exp|expiry|cvv))",  # Name without "valid thru"
-        "date": r"\b(\d{2}/\d{2})\b"  # MM/YY format
+   
+    # Exclude words like "VALID" and "THRU" from being detected as names
+    name_candidates = re.findall(r"\b[A-Z][A-Z ]{2,}\b", text)
+    filtered_names = [name for name in name_candidates if name not in {"VALID", "THRU"}]
+    name_match = filtered_names[-1] if filtered_names else None  # Take the last detected name, assuming it appears at the end
+
+    return {
+        "credit_card_number": card_number_match.group(0) if card_number_match else None,
+        "name": name_match,
+        "valid_thru": valid_thru_match if valid_thru_match else None,
+        "cvv": cvv_match,
     }
+def extract_text_from_image(image_path: str) -> str:
+    try:
+        image = Image.open(image_path)
+        text = pytesseract.image_to_string(image)
+        return text
+    except Exception as e:
+        print(f"Error processing image: {e}")
+        return ""
 
-    # Determine what to extract
-    task_lower = task.lower()
-    extracted_info = None
-    for key, pattern in patterns.items():
-        if key in task_lower:
-            match = re.search(pattern, extracted_text)
-            if match:
-                extracted_info = match.group(1)
-                break
-
-    if not extracted_info:
-        raise HTTPException(status_code=400, detail="Requested card information not found.")
-
-    output_filename = f"credit-card-{key.replace(' ', '-')}.txt"
-    output_path = os.path.join(DATA_DIR, output_filename)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(extracted_info)
-
-    return f"Extracted '{key}' and saved to {output_path}"
-from itertools import combinations
-
-def find_similar_comments():
-    comments_file = f"{DATA_DIR}/comments.txt"
-
-    if not os.path.exists(comments_file):
-        raise HTTPException(status_code=404, detail="Comments file not found.")
-
-    with open(comments_file, "r", encoding="utf-8") as f:
-        comments = [line.strip() for line in f if line.strip()]
-
-    if len(comments) < 2:
-        raise HTTPException(status_code=400, detail="Not enough comments to compare.")
-
-    # Generate embeddings
-    response = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=comments
-    )
+def extract_credit_card_info(task: str):
+    image_path = f"{DATA_DIR}/credit_card.png"
+    extracted_text = extract_text_from_image(image_path)
     
-    embeddings = [entry["embedding"] for entry in response["data"]]
+    if not extracted_text.strip():
+        return {"error": "No text extracted from the image."}
+    
+    extracted_info = parse_credit_card_info(extracted_text)
 
-    # Compute cosine similarity
-    def cosine_similarity(vec1, vec2):
-        dot_product = sum(a * b for a, b in zip(vec1, vec2))
-        magnitude = (sum(a ** 2 for a in vec1) ** 0.5) * (sum(b ** 2 for b in vec2) ** 0.5)
-        return dot_product / magnitude if magnitude else 0
+    # Determine which fields to include based on the query
+    requested_fields = []
+    field_map = {
+        "card number": "credit_card_number",
+        "name": "name",
+        "valid thru": "valid_thru",
+        "cvv": "cvv"
+    }
 
-    most_similar_pair = None
-    highest_similarity = -1
+    for key in field_map:
+        if key in task.lower():
+            requested_fields.append(field_map[key])
 
-    for (i, j) in combinations(range(len(comments)), 2):
-        similarity = cosine_similarity(embeddings[i], embeddings[j])
-        if similarity > highest_similarity:
-            highest_similarity = similarity
-            most_similar_pair = (comments[i], comments[j])
+    if not requested_fields:
+        requested_fields = field_map.values()  # Default to all fields if none are explicitly asked
 
-    if not most_similar_pair:
-        raise HTTPException(status_code=400, detail="Could not determine the most similar comments.")
+    # Save only the requested fields in a text file
+    output_file = os.path.join(DATA_DIR, "credit-card.txt")
+    try:
+        with open(output_file, "w") as f:
+            for field in requested_fields:
+                if extracted_info[field]:
+                    f.write(f"{field}: {extracted_info[field]}\n")
+    except Exception as e:
+        print(f"Error writing to file: {e}")
 
-    output_path = f"{DATA_DIR}/comments-similar.txt"
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(most_similar_pair))
+    return {field: extracted_info[field] for field in requested_fields}
 
-    return f"Most similar comments written to {output_path}"
+
+def find_similar_comments(task: str):
+    with open(f"{DATA_DIR}/comments.txt") as f:
+        comments = f.readlines()
+    response = client.embeddings.create(model="text-embedding-3-small", input=comments)
+    embeddings = {comment: emb.embedding for comment, emb in zip(comments, response.data)}
+    most_similar = min(embeddings.keys(), key=lambda x: sum(embeddings[x]))
+    with open(f"{DATA_DIR}/comments-similar.txt", "w") as f:
+        f.writelines(most_similar)
+    
 def calculate_ticket_sales(task):
     db_path = f"{DATA_DIR}/ticket-sales.db"
 
@@ -546,31 +533,18 @@ def extract_filter_from_task(task):
         column_value = words[index + 1:]
         return column_value[0], column_value[-1] if len(column_value) > 1 else None
     return None, None
+
+
 def execute_task(task: str):
-    Prompt = """You are an AI that maps user tasks to predefined function names. 
-    Given a task, return the best matching function from this list: 
+    Prompt = f"""You are an AI that maps user tasks to predefined function names. 
+    Given a task, return the best matching function from this list:
 
-    - generate_data: Install dependencies and run data generation
-    - format_file: Format a file using a specified formatter
-    - count_weekday: Count occurrences of a specific weekday in a file
-    - sort_contacts: Sort contacts by first and last name in ascending or descending order
-    - extract_logs: Extract logs based on a given time range (recent, old, or specific period),recent can also be new old can also be past like relatable words should be considered
-    - generate_markdown_index: Create an index from Markdown files
-    - extract_email_sender: Extract the sender's email from an email file
-    - extract_credit_card_info: Extract a credit card number, name, valid thru and cvv number from an image
-    - find_similar_comments: Identify the most similar comments using embeddings
-    - calculate_ticket_sales: Compute total ticket sales, optionally filtered by ticket type. the ticket type may be specified in query itself like gold ticket sale or silver ticket sales consider that also
-    - fetch_api_data: Fetch data from an API and save it to a file
-    - clone_git_repo: Clone a Git repository into a folder
-    - run_sql_query: Execute an SQL query on a database
-    - compress_image: Compress an image file
-    - transcribe_audio: Transcribe an audio file
-    - convert_markdown_to_html: Convert Markdown content to HTML
-    - filter_csv: Filter a CSV file based on a column value
+    {", ".join(TASKS.keys())}.
 
-
-    Respond with only the function name, without extra explanations.
+    Ensure the returned function name matches exactly one from the list.
+    Respond with only the function name.
     """
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -578,44 +552,73 @@ def execute_task(task: str):
             {"role": "user", "content": task}
         ]
     )
+    
     action = response.choices[0].message.content.strip().lower()
-     # Debugging: Print the LLM response to see if it's correct
+
+    # Debugging LLM output
     print(f"🔍 LLM Response: {action}")
 
-    # Standardize common variations
-    if "generate" in action and "data" in action:
+    # Standardizing task name matching
+    if "generate data" in action:
         return generate_data()
-    elif "count" in action and "day" in action:
+    elif "count weekday" in action:
         return count_specific_day(task)
-    elif "sort" in action and "contact" in action:
-        return sort_contacts()
-    elif "find recent logs" in action or "oldest logs" in action:
+    elif "format markdown" in action:
+        return format_markdown()
+    elif "sort contacts" in action:
+        return sort_contacts(task)
+    elif ("find" in action or "extract" in action) and ("recent" in action or "old" in action) and "logs" in action:
         return extract_logs(task)
     elif "extract email" in action:
         return extract_email_info(task)
     elif "credit card" in action:
         return extract_credit_card_info(task)
+    elif "similar comments" in action:
+        return find_similar_comments()
     elif "ticket sales" in action or "total sales" in action:
         return calculate_ticket_sales(task)
-    elif "fetch api data" in task.lower():
+    elif "fetch api data" in action:
         return fetch_api_data(task)
-    elif "clone repo" in task.lower() or "commit" in task.lower():
+    elif "clone git repo" in action or "commit" in action:
         return clone_and_commit_repo(task)
-    elif "run sql query" in task.lower():
+    elif "run sql query" in action:
         return run_sql_query(task)
-    elif "scrape website" in task.lower():
+    elif "scrape website" in action:
         return scrape_website(task)
-    elif "resize image" in task.lower() or "compress image" in task.lower():
+    elif "resize image" in action or "compress image" in action:
         return compress_resize_image(task)
-    elif "transcribe audio" in task.lower():
-        return transcribe_audio()
-    elif "convert markdown" in task.lower():
-        return convert_markdown_to_html()
-    elif "filter csv" in task.lower():
+    elif "transcribe audio" in action:
+        return transcribe_audio(task)
+    elif "convert markdown" in action:
+        return convert_markdown_to_html(task)
+    elif "filter csv" in action:
         return filter_csv(task)
-
+    if action in TASKS:
+        return TASKS[action](task)
     else:
         raise HTTPException(status_code=400, detail="Task not recognized.")
+TASKS = {
+    "generate_data": generate_data,
+    "count_specific_day": count_specific_day,
+    "format_markdown": format_markdown,
+    "sort_contacts": sort_contacts,
+    "extract_logs": extract_logs,
+    "extract_email_info": extract_email_info,
+    "extract_credit_card_info": extract_credit_card_info,
+    "find_similar_comments": find_similar_comments,
+    "calculate_ticket_sales": calculate_ticket_sales,
+    "fetch_api_data": fetch_api_data,
+    "clone_and_commit_repo": clone_and_commit_repo,
+    "run_sql_query": run_sql_query,
+    "scrape_website": scrape_website,
+    "compress_resize_image": compress_resize_image,
+    "transcribe_audio": transcribe_audio,
+    "convert_markdown_to_html": convert_markdown_to_html,
+    "filter_csv": filter_csv,
+    "find_similar_comments": find_similar_comments
+}
+    
+
 # API Routes
 @app.post("/run")
 def run_task(task: str = Query(..., description="Task description")):
@@ -635,9 +638,6 @@ def read_file(path: str = Query(..., description="Path to the file")):
         return {"content": content}
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="File not found.")
-
-
-
 
 # Block deletion functions to prevent accidental deletions
 def restricted_os_remove(path):
