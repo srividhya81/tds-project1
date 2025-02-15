@@ -13,7 +13,7 @@ import json
 import uvicorn
 load_dotenv()
 app = FastAPI()
-DATA_DIR = "./data"  # Ensure this is writable
+DATA_DIR = "/app/data"  # Ensure this is writable
 os.makedirs(DATA_DIR, exist_ok=True)  # Create it if it doesn't exist
 response_format = {
     "type": "json_schema",
